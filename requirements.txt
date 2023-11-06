@@ -1,0 +1,7 @@
+openai
+huggingface-hub
+datasets
+python-dotenv
+tqdm
+jupyterlab
+ipywidgets
