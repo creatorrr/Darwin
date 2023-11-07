@@ -9,3 +9,10 @@ venv.bak/
 
 # Default output
 output.csv
+
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+*.rdb
