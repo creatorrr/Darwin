@@ -1,9 +1,18 @@
 import os
-from dotenv import load_dotenv
-import openai
 import csv
 import argparse
+
+from dotenv import load_dotenv
+from openai import OpenAI
+from redis import StrictRedis
+from redis_cache import RedisCache
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_random_exponential,
+)
 from tqdm import tqdm
+
 from prompts import EQUAL_PROMPT, SYSTEM_PROMPTS, DEPTH_EVOLUTION_PROMPTS, DIFFICULTY_PROMPT, BREADTH_EVOLUTION_PROMPT
 
 # Load environment variables from .env.local file
@@ -14,7 +23,7 @@ openai_api_key = os.environ.get('OPENAI_API_KEY')
 if not openai_api_key:
     raise ValueError("OPENAI_API_KEY not found in .env.local file or environment variables")
 
-openai.api_key = openai_api_key
+openai = OpenAI(api_key=openai_api_key)
 
 class Node:
     def __init__(self, system_prompt, user_prompt, assistant_response, is_refusal=False, parent=None):
@@ -25,7 +34,7 @@ class Node:
         self.children = []
         self.parent = parent
 
-def should_prune(evolved_prompt, parent):
+def should_prune(evolved_prompt, parent, **kwargs):
     """Evaluate the fitness of a potential child node based on its evolved prompt"""
 
     if evolved_prompt == None:
@@ -40,7 +49,7 @@ def should_prune(evolved_prompt, parent):
         return True
     
     comparison_prompt = EQUAL_PROMPT.format(first=evolved_prompt, second=parent.user_prompt)
-    response = get_response(comparison_prompt)
+    response = get_response(comparison_prompt, **kwargs)
 
     # Prune if the model deems them equal
     if response and response.strip() == "Equal":
@@ -97,36 +106,38 @@ def validate_csv_format(filename):
 
     return True
 
-def get_response(prompt_text):
+@retry(wait=wait_random_exponential(min=10, max=100), stop=stop_after_attempt(120))
+def get_response(prompt_text, model="gpt-3.5-turbo", temperature=0.8):
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt_text}], temperature=0.8
+        response = openai.chat.completions.create(
+            model=model, messages=[{"role": "user", "content": prompt_text}], temperature=temperature
         )
         return response.choices[0].message.content
-    except openai.error.OpenAIError as e:
-        print(f"Error occurred while fetching response from OpenAI: {e}. Skipping this prompt.")
-        return None  # return None to indicate a failed request
 
-def evolve(node):
+    except BaseException as e:
+        print(f"Error occurred while fetching response from OpenAI: {e}. Skipping this prompt.")
+        raise
+
+def evolve(node, **kwargs):
     """Evolve the current node, return node to add as a new root node"""
 
     # Evolve node using depth evolution prompts
     for prompt_template in DEPTH_EVOLUTION_PROMPTS:
         prompt_text = prompt_template.format(prompt=node.user_prompt)
-        response_text = get_response(prompt_text)  # Assuming you have a function `get_response` that talks to OpenAI API
+        response_text = get_response(prompt_text, **kwargs)  # Assuming you have a function `get_response` that talks to OpenAI API
         
         # Check if the evolved prompt should be pruned
-        if not should_prune(response_text, node):
+        if not should_prune(response_text, node, **kwargs):
             # If not pruned, then create a new child node and add to the tree
             new_node = Node(system_prompt=node.system_prompt, user_prompt=response_text, assistant_response="", parent=node)
             node.children.append(new_node)
 
     # Evolve node using breadth evolution prompt
     prompt_text = BREADTH_EVOLUTION_PROMPT.format(prompt=node.user_prompt)
-    response_text = get_response(prompt_text)
+    response_text = get_response(prompt_text, **kwargs)
     
     # Check if the evolved prompt should be pruned
-    if not should_prune(response_text, node):
+    if not should_prune(response_text, node, **kwargs):
         # If not pruned, then create a new child node and add to the tree
         new_node = Node(system_prompt=node.system_prompt, user_prompt=response_text, assistant_response="", parent=node)
         return new_node
@@ -196,6 +207,14 @@ def main():
     # Optional argument for the number of epochs, defaults to 4
     parser.add_argument('--epochs', type=int, default=4, help='Number of epochs to evolve the leaf nodes. Defaults to 4.')
 
+    # Optional argument for model name, defaults to gpt-3.5-turbo
+    parser.add_argument('--model', type=str, default="gpt-3.5-turbo", help='Model to use')
+
+    # Optional argument for the temperature, defaults to 0.8
+    parser.add_argument('--temperature', type=float, default=0.8, help='Temperature')
+
+    # Optional argument to use redis for cache, defaults to False
+    parser.add_argument('--use-redis', type=bool, default=False, help='Use redis cache')
 
     args = parser.parse_args()
     
@@ -206,6 +225,13 @@ def main():
             print("CSV format is not valid. Please check the file.")
         return  # Exit after validation
     
+    if args.use_redis:
+        client = StrictRedis(host="localhost", decode_responses=True)
+        cache = RedisCache(redis_client=client)
+
+        global get_response
+        get_response = cache.cache()(get_response)
+
     forest = load_forest_from_csv(args.csv_file)
 
     print("Evolving prompts from " + args.csv_file + " for " + str(args.epochs) + " epochs.")
@@ -222,7 +248,7 @@ def main():
         
         # Use tqdm to wrap around the leaf nodes iteration
         for leaf in tqdm(all_leaf_nodes, desc=f"Epoch {epoch+1} Progress", ncols=100):
-            new_root = evolve(leaf)
+            new_root = evolve(leaf, model=args.model, temperature=args.temperature)
             if new_root:
                 forest.append(new_root)
                 root_nodes_added += 1

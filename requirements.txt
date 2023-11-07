@@ -5,3 +5,10 @@ python-dotenv
 tqdm
 jupyterlab
 ipywidgets
+scikit-learn
+nltk
+pandas
+numpy
+redis
+python-redis-cache
+tenacity
